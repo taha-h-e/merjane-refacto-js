@@ -1,87 +1,57 @@
-/* eslint-disable @typescript-eslint/switch-exhaustiveness-check */
-/* eslint-disable max-depth */
-/* eslint-disable no-await-in-loop */
-import {eq} from 'drizzle-orm';
-import fastifyPlugin from 'fastify-plugin';
-import {serializerCompiler, validatorCompiler, type ZodTypeProvider} from 'fastify-type-provider-zod';
-import {z} from 'zod';
-import {orders, products} from '@/db/schema.js';
+import { eq } from "drizzle-orm";
+import fastifyPlugin from "fastify-plugin";
+import {
+  serializerCompiler,
+  validatorCompiler,
+  type ZodTypeProvider,
+} from "fastify-type-provider-zod";
+import { z } from "zod";
 
-export const myController = fastifyPlugin(async server => {
-	// Add schema validator and serializer
-	server.setValidatorCompiler(validatorCompiler);
-	server.setSerializerCompiler(serializerCompiler);
+import { orders } from "@/db/schema.js";
+import { ProductProcessorService } from "@/services/product-processor.service.js";
 
-	server.withTypeProvider<ZodTypeProvider>().post('/orders/:orderId/processOrder', {
-		schema: {
-			params: z.object({
-				orderId: z.coerce.number(),
-			}),
-		},
-	}, async (request, reply) => {
-		const dbse = server.diContainer.resolve('db');
-		const ps = server.diContainer.resolve('ps');
-		const order = (await dbse.query.orders
-			.findFirst({
-				where: eq(orders.id, request.params.orderId),
-				with: {
-					products: {
-						columns: {},
-						with: {
-							product: true,
-						},
-					},
-				},
-			}))!;
-		console.log(order);
-		const ids: number[] = [request.params.orderId];
-		const {products: productList} = order;
+export const myController = fastifyPlugin(async (server) => {
+  // Configure schema validation
+  server.setValidatorCompiler(validatorCompiler);
+  server.setSerializerCompiler(serializerCompiler);
 
-		if (productList) {
-			for (const {product: p} of productList) {
-				switch (p.type) {
-					case 'NORMAL': {
-						if (p.available > 0) {
-							p.available -= 1;
-							await dbse.update(products).set(p).where(eq(products.id, p.id));
-						} else {
-							const {leadTime} = p;
-							if (leadTime > 0) {
-								await ps.notifyDelay(leadTime, p);
-							}
-						}
+  server.withTypeProvider<ZodTypeProvider>().post(
+    "/orders/:orderId/processOrder",
+    {
+      schema: {
+        params: z.object({
+          orderId: z.coerce.number(),
+        }),
+      },
+    },
+    async (request, reply) => {
+      const db = server.diContainer.resolve("db");
+      const productService = server.diContainer.resolve("ps");
+      const processor = new ProductProcessorService(productService);
 
-						break;
-					}
+      const order = await db.query.orders.findFirst({
+        where: eq(orders.id, request.params.orderId),
+        with: {
+          products: {
+            columns: {},
+            with: {
+              product: true,
+            },
+          },
+        },
+      });
 
-					case 'SEASONAL': {
-						const currentDate = new Date();
-						if (currentDate > p.seasonStartDate! && currentDate < p.seasonEndDate! && p.available > 0) {
-							p.available -= 1;
-							await dbse.update(products).set(p).where(eq(products.id, p.id));
-						} else {
-							await ps.handleSeasonalProduct(p);
-						}
+      if (!order) {
+        return reply.status(404).send({ error: "Order not found" });
+      }
 
-						break;
-					}
+      const { products: orderProducts } = order;
 
-					case 'EXPIRABLE': {
-						const currentDate = new Date();
-						if (p.available > 0 && p.expiryDate! > currentDate) {
-							p.available -= 1;
-							await dbse.update(products).set(p).where(eq(products.id, p.id));
-						} else {
-							await ps.handleExpiredProduct(p);
-						}
+      for (const { product } of orderProducts) {
+        await processor.process(product);
+      }
 
-						break;
-					}
-				}
-			}
-		}
-
-		await reply.send({orderId: order.id});
-	});
+      await reply.send({ orderId: order.id });
+    }
+  );
 });
-
